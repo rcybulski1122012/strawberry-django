@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import copy
 import dataclasses
+import hashlib
 import itertools
 from collections.abc import Callable
 from typing import (
@@ -32,7 +33,6 @@ from graphql import (
     GraphQLOutputType,
     GraphQLWrappingType,
     get_argument_values,
-    print_ast,
 )
 from graphql.language.ast import OperationType
 from graphql.type.definition import GraphQLResolveInfo, get_named_type
@@ -95,7 +95,10 @@ __all__ = [
     "OptimizerConfig",
     "OptimizerStore",
     "PrefetchType",
+    "get_field_arguments",
+    "get_hint_value",
     "optimize",
+    "optimizer_hint_key",
 ]
 
 _M = TypeVar("_M", bound=models.Model)
@@ -103,7 +106,19 @@ _M = TypeVar("_M", bound=models.Model)
 _sentinel = object()
 _annotate_placeholder = "__annotated_placeholder__"
 
-ALIAS_PREFIX = "_strawberry_alias_"
+_alias_prefix = "_strawberry_alias_"
+
+
+def _alias_attr(key: str) -> str:
+    """Build a stable attribute name scoped to a response key (alias).
+
+    A response key may contain ``__`` or start with ``_``, which combined with
+    ``_alias_prefix`` would form a ``LOOKUP_SEP`` that Django's
+    ``Prefetch.to_attr`` splits into nested lookups. Hashing to a hex digest
+    avoids that while staying deterministic across collection and resolve time.
+    """
+    digest = hashlib.blake2b(key.encode(), digest_size=8).hexdigest()
+    return f"{_alias_prefix}{digest}"
 
 
 @dataclasses.dataclass
@@ -249,7 +264,7 @@ class OptimizerStore:
         for p in self.prefetch_related:
             if isinstance(p, Callable):
                 assert_type(p, PrefetchCallable)
-                p = p(info)  # noqa: PLW2901
+                p = p(info)  # ruff: ignore[redefined-loop-name]
 
             if isinstance(p, str):
                 prefetch_related.append(f"{prefix}{LOOKUP_SEP}{p}")
@@ -265,7 +280,7 @@ class OptimizerStore:
         for k, v in self.annotate.items():
             if isinstance(v, Callable):
                 assert_type(v, AnnotateCallable)
-                v = v(info)  # noqa: PLW2901
+                v = v(info)  # ruff: ignore[redefined-loop-name]
             annotate[f"{prefix}{LOOKUP_SEP}{k}"] = v
 
         return self.__class__(
@@ -307,7 +322,7 @@ class OptimizerStore:
             config=config,
         )
 
-        return qs  # noqa: RET504
+        return qs  # ruff: ignore[unnecessary-assign]
 
     def _apply_prefetch_related(
         self,
@@ -338,7 +353,7 @@ class OptimizerStore:
 
             if isinstance(p, Callable):
                 assert_type(p, PrefetchCallable)
-                p = p(strawberry_info)  # noqa: PLW2901
+                p = p(strawberry_info)  # ruff: ignore[redefined-loop-name]
 
             path = p.prefetch_to
             existing = to_prefetch.get(path)
@@ -376,7 +391,7 @@ class OptimizerStore:
             try:
                 from django.contrib.contenttypes.fields import GenericRelation
             except (ImportError, RuntimeError):
-                GenericRelation = None  # noqa: N806
+                GenericRelation = None  # ruff: ignore[non-lowercase-variable-in-function]
 
             parent_model = qs.model
             for prefetch in to_prefetch.values():
@@ -436,7 +451,7 @@ class OptimizerStore:
         self,
         qs: QuerySet[_M],
         *,
-        info: GraphQLResolveInfo,
+        info: GraphQLResolveInfo | None,
         config: OptimizerConfig,
     ) -> tuple[QuerySet[_M], set[str]]:
         only_set = set(self.only)
@@ -472,7 +487,9 @@ class OptimizerStore:
                 if select_related in only_set:
                     continue
 
-                if not any(only.startswith(select_related) for only in only_set):
+                if not any(
+                    _is_relation_path_covered(only, select_related) for only in only_set
+                ):
                     extra_only_set.add(select_related)
 
         return qs, extra_only_set
@@ -508,10 +525,19 @@ class OptimizerStore:
         for k, v in self.annotate.items():
             if isinstance(v, Callable):
                 assert_type(v, AnnotateCallable)
-                v = v(strawberry_info)  # noqa: PLW2901
+                v = v(strawberry_info)  # ruff: ignore[redefined-loop-name]
             to_annotate[k] = v
 
         return qs.annotate(**to_annotate)
+
+
+def _is_relation_path_covered(candidate: str, target: str) -> bool:
+    """Whether `candidate` is `target` itself or a `LOOKUP_SEP`-bounded descendant of it.
+
+    A plain `candidate.startswith(target)` is wrong: e.g. "empresa_comercial"
+    starts with "empresa" even though they're unrelated sibling fields.
+    """
+    return candidate == target or candidate.startswith(f"{target}{LOOKUP_SEP}")
 
 
 def _create_strawberry_info(raw_info: GraphQLResolveInfo) -> Info:
@@ -716,10 +742,95 @@ def _get_selections(
     return get_sub_field_selections(info, parent_type)
 
 
-def _get_field_arguments(node: FieldNode) -> tuple:
-    return tuple(
-        print_ast(a) for a in sorted(node.arguments or (), key=lambda a: a.name.value)
+def _get_field_arguments(
+    node: FieldNode,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    info: GraphQLResolveInfo,
+) -> Any:
+    """Return the selection's coerced argument values, for comparison."""
+    field_def = parent_type.fields.get(node.name.value)
+    if field_def is None:
+        # Meta field (e.g. `__typename`) - never reaches a store, dropped later.
+        return None
+
+    return get_argument_values(field_def, node, info.variable_values)
+
+
+def optimizer_hint_key(info: Info) -> str:
+    """Return a unique attribute name for the current field selection.
+
+    Derived from the response key - the alias if the field is aliased,
+    otherwise the field's own name. Response keys are guaranteed to be unique
+    within a selection set, and this returns the same value during optimizer
+    hint collection and at resolve time.
+
+    Use it to name an annotation or a `Prefetch(to_attr=...)` inside an
+    optimizer hint callable, and `get_hint_value` to read the value back
+    inside the resolver.
+    """
+    return _alias_attr(str(info.path.key))
+
+
+def get_hint_value(
+    source: Any,
+    info: Info,
+    default_attr: str | None = None,
+    *,
+    default: Any = _sentinel,
+) -> Any:
+    """Read the value produced by an optimizer hint for the current selection.
+
+    Probe order:
+
+    1. the alias-scoped label (`f"{optimizer_hint_key(info)}{LOOKUP_SEP}{default_attr}"`),
+       if `default_attr` is given - set when a dict annotation callable with
+       that label ran for this specific selection
+    2. the alias-scoped attribute (`optimizer_hint_key(info)`) - set when a
+       single-expression annotation callable ran for this specific selection,
+       or by a `Prefetch(to_attr=optimizer_hint_key(info))`
+    3. `default_attr`, if given - the plain annotation label used when the
+       field is not aliased
+    4. `default`, if given - useful to handle the optimizer being turned off
+    5. raise `AttributeError`
+    """
+    hint_key = optimizer_hint_key(info)
+
+    if default_attr is not None:
+        value = getattr(source, f"{hint_key}{LOOKUP_SEP}{default_attr}", _sentinel)
+        if value is not _sentinel:
+            return value
+
+    value = getattr(source, hint_key, _sentinel)
+    if value is not _sentinel:
+        return value
+
+    if default_attr is not None:
+        value = getattr(source, default_attr, _sentinel)
+        if value is not _sentinel:
+            return value
+
+    if default is not _sentinel:
+        return default
+
+    raise AttributeError(
+        f"No optimizer hint value found for {info.path.key!r} on {source!r}. "
+        "Was the query executed without DjangoOptimizerExtension?"
     )
+
+
+def get_field_arguments(info: Info) -> dict[str, Any]:
+    """Resolve the argument values of the current field selection.
+
+    Returns the coerced arguments (including variables and schema defaults) of
+    the specific selection - i.e. of the alias being processed, if the field is
+    aliased. Meant for use inside optimizer hint callables, where the arguments
+    aren't otherwise available (inside a resolver they already arrive as kwargs).
+    """
+    raw_info = info._raw_info
+    field_node = raw_info.field_nodes[0]
+    parent_type = raw_info.parent_type
+    field_def = parent_type.fields[field_node.name.value]
+    return get_argument_values(field_def, field_node, raw_info.variable_values)
 
 
 def _generate_selection_resolve_info(
@@ -729,12 +840,16 @@ def _generate_selection_resolve_info(
     parent_type: GraphQLObjectType | GraphQLInterfaceType,
 ):
     field_node = field_nodes[0]
+    # Use the response key (alias if present) as the path key so that it matches
+    # `info.path.key` at resolve time, keeping `optimizer_hint_key` consistent
+    # between hint collection and resolution.
+    response_key = field_node.alias.value if field_node.alias else field_node.name.value
     return GraphQLResolveInfo(
         field_name=field_node.name.value,
         field_nodes=field_nodes,
         return_type=return_type,
         parent_type=cast("GraphQLObjectType", parent_type),
-        path=info.path.add_key(0).add_key(field_node.name.value, parent_type.name),
+        path=info.path.add_key(0).add_key(response_key, parent_type.name),
         schema=info.schema,
         fragments=info.fragments,
         root_value=info.root_value,
@@ -743,6 +858,95 @@ def _generate_selection_resolve_info(
         context=info.context,
         is_awaitable=info.is_awaitable,
     )
+
+
+def _find_strawberry_field(
+    object_definition: StrawberryObjectDefinition,
+    schema: Schema,
+    field_name: str,
+) -> StrawberryField | None:
+    for field in object_definition.fields:
+        if schema.config.name_converter.get_graphql_name(field) == field_name:
+            return field
+    return None
+
+
+def _aliases_share_prefetch_target(
+    groups: list[list[FieldNode]],
+    object_definition: StrawberryObjectDefinition,
+    schema: Schema,
+    *,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    info: GraphQLResolveInfo,
+) -> bool:
+    """Whether all aliases resolve their prefetch hints to the same attribute.
+
+    A callable ``prefetch_related`` may derive its ``to_attr`` from the response
+    key (``to_attr=optimizer_hint_key(info)``), giving each alias a distinct
+    target that must stay separate; a shared/static target can be merged. True
+    when there are no callable prefetch hints or every alias agrees.
+    """
+    field = _find_strawberry_field(object_definition, schema, groups[0][0].name.value)
+    store = cast("OptimizerStore | None", getattr(field, "store", None))
+    if not store or not any(callable(p) for p in store.prefetch_related):
+        return True
+
+    targets: set[frozenset[str]] = set()
+    for group in groups:
+        field_data = _get_field_data(
+            group, object_definition, schema, parent_type=parent_type, info=info
+        )
+        if field_data is None:
+            # Couldn't resolve one of the aliases - keep them separate to be safe.
+            return False
+
+        f_field, _, _, f_info = field_data
+        f_strawberry_info = schema.config.info_class(_raw_info=f_info, _field=f_field)
+        group_targets = {
+            (p(f_strawberry_info) if callable(p) else p) for p in store.prefetch_related
+        }
+        targets.add(
+            frozenset(p if isinstance(p, str) else p.prefetch_to for p in group_targets)
+        )
+        if len(targets) > 1:
+            return False
+
+    return True
+
+
+def _mergeable_alias_groups(
+    groups: list[list[FieldNode]],
+    object_definition: StrawberryObjectDefinition,
+    schema: Schema,
+    *,
+    parent_type: GraphQLObjectType | GraphQLInterfaceType,
+    info: GraphQLResolveInfo,
+) -> list[list[FieldNode]]:
+    """Return the largest set of aliases that can share one default prefetch.
+
+    Aliases can be read back from a single prefetch (via ``get_hint_value``'s
+    fallthrough) only when they agree on both arguments and prefetch target, so
+    this buckets them by coerced arguments and returns the largest bucket. The
+    rest keep a distinct ``to_attr``. Empty unless at least two aliases match,
+    matching the behaviour of a lone connection or paginated field.
+    """
+    if not _aliases_share_prefetch_target(
+        groups, object_definition, schema, parent_type=parent_type, info=info
+    ):
+        return []
+
+    buckets: list[tuple[Any, list[list[FieldNode]]]] = []
+    for group in groups:
+        args = _get_field_arguments(group[0], parent_type, info)
+        for bucket_args, bucket in buckets:
+            if bucket_args == args:
+                bucket.append(group)
+                break
+        else:
+            buckets.append((args, [group]))
+
+    largest = max(buckets, key=lambda bucket: len(bucket[1]))[1]
+    return largest if len(largest) > 1 else []
 
 
 def _get_field_data(
@@ -755,10 +959,8 @@ def _get_field_data(
 ) -> tuple[StrawberryField, GraphQLObjectType, FieldNode, GraphQLResolveInfo] | None:
     selection = selections[0]
     field_name = selection.name.value
-    for field in object_definition.fields:
-        if schema.config.name_converter.get_graphql_name(field) == field_name:
-            break
-    else:
+    field = _find_strawberry_field(object_definition, schema, field_name)
+    if field is None:
         return None
 
     # Do not optimize the field if the user asked not to
@@ -784,6 +986,7 @@ def _get_hints_from_field(
     *,
     f_info: Info,
     prefix: str = "",
+    hint_key: str | None = None,
 ) -> OptimizerStore | None:
     if not (
         field_store := cast("OptimizerStore | None", getattr(field, "store", None))
@@ -795,12 +998,25 @@ def _get_hints_from_field(
         # because when field_store was created on __init__,
         # the field name wasn't available.
         # This allows for annotate expressions to be declared as:
-        #   total: int = gql.django.field(annotate=Sum("price"))  # noqa: ERA001
+        #   total: int = gql.django.field(annotate=Sum("price"))  # ruff: ignore[commented-out-code]
         # Instead of the more redundant:
-        #   total: int = gql.django.field(annotate={"total": Sum("price")})  # noqa: ERA001
+        #   total: int = gql.django.field(annotate={"total": Sum("price")})  # ruff: ignore[commented-out-code]
         field_store.annotate = {
             field.name: field_store.annotate[_annotate_placeholder],
         }
+
+    if hint_key and field_store.annotate:
+        # Static expressions can't depend on the alias arguments, so they keep
+        # their shared label and are annotated only once.
+        def _scoped_label(label: str, value: AnnotateType) -> str:
+            if not callable(value):
+                return label
+            if label == field.name:
+                return hint_key
+            return f"{hint_key}{LOOKUP_SEP}{label}"
+
+        annotate = {_scoped_label(k, v): v for k, v in field_store.annotate.items()}
+        field_store = dataclasses.replace(field_store, annotate=annotate)
 
     # with_prefix also resolves callables, so we only need one or the other
     return (
@@ -963,9 +1179,17 @@ def _get_hints_from_django_relation(
     try:
         from django.contrib.contenttypes.fields import GenericRelation
     except (ImportError, RuntimeError):  # pragma: no cover
-        GenericRelation = None  # noqa: N806
+        GenericRelation = None  # ruff: ignore[non-lowercase-variable-in-function]
 
     store = OptimizerStore()
+
+    # A per-alias `to_attr` prefetches into a plain list attribute, which only a
+    # list field reads back. Connection/paginated resolvers expect
+    # `_prefetched_objects_cache` and an optional field expects a `.first()`
+    # scalar, so skip entirely - before the recursion, cache append or
+    # get_queryset hook, none of which should run for a dropped prefetch.
+    if to_attr and not getattr(field, "is_list", False):
+        return store
 
     f_types = list(get_possible_type_definitions(field.type))
     if len(f_types) > 1:
@@ -1062,14 +1286,6 @@ def _get_hints_from_django_relation(
     if is_inheritance_qs(base_qs):
         base_qs = base_qs.select_subclasses(*subclasses)
     field_qs = field_store.apply(base_qs, info=field_info, config=config)
-    # Don't use to_attr for connection/paginated fields - their resolvers
-    # expect data in _prefetched_objects_cache, not as a plain list attribute.
-    # If to_attr was requested but can't be used, skip optimization entirely
-    # to avoid merging conflicting prefetches for the same path.
-    if to_attr and (
-        getattr(field, "is_connection", False) or getattr(field, "is_paginated", False)
-    ):
-        return store
     field_prefetch = Prefetch(path, queryset=field_qs, to_attr=to_attr)
     field_prefetch._optimizer_sentinel = _sentinel  # type: ignore
     store.prefetch_related.append(field_prefetch)
@@ -1092,11 +1308,10 @@ def _store_declares_select_related(
     if not field_store:
         return False
 
-    for sr in field_store.select_related:
-        if sr == relation_name or sr.startswith(f"{relation_name}{LOOKUP_SEP}"):
-            return True
-
-    return False
+    return any(
+        _is_relation_path_covered(sr, relation_name)
+        for sr in field_store.select_related
+    )
 
 
 def _get_hints_from_django_field(
@@ -1120,8 +1335,8 @@ def _get_hints_from_django_field(
             GenericRelation,
         )
     except (ImportError, RuntimeError):  # pragma: no cover
-        GenericForeignKey = None  # noqa: N806
-        GenericRelation = None  # noqa: N806
+        GenericForeignKey = None  # ruff: ignore[non-lowercase-variable-in-function]
+        GenericRelation = None  # ruff: ignore[non-lowercase-variable-in-function]
         relation_fields = (models.ManyToManyField, ManyToManyRel, ManyToOneRel)
     else:
         relation_fields = (
@@ -1239,7 +1454,10 @@ def _get_hints_from_django_field(
         store = OptimizerStore.with_hints(only=[path])
         if relation_prefix:
             relation_path = f"{lookup_prefix}{relation_prefix}"
-            if not any(sr.startswith(relation_path) for sr in store.select_related):
+            if not any(
+                _is_relation_path_covered(sr, relation_path)
+                for sr in store.select_related
+            ):
                 store.select_related.append(relation_path)
 
     return store
@@ -1363,27 +1581,32 @@ def _get_model_hints(
         name = field_nodes[0].name.value
         field_name_groups.setdefault(name, []).append(field_nodes)
 
-    # Merge aliased selections with the same arguments; keep aliases with
-    # different args as separate entries by assigning distinct to_attr values.
-    # list of (field_nodes, to_attr)
+    # Merge aliased selections that share args and prefetch target; keep the
+    # rest as separate entries with distinct to_attr values.
     merged_node_lists: list[tuple[list[FieldNode], str | None]] = []
     for groups in field_name_groups.values():
         if len(groups) == 1:
             merged_node_lists.append((groups[0], None))
-        else:
-            first_args = _get_field_arguments(groups[0][0])
-            if all(_get_field_arguments(g[0]) == first_args for g in groups[1:]):
-                # Same args across all aliases - merge into single entry, no to_attr
-                merged_node_lists.append((
-                    [node for group in groups for node in group],
-                    None,
-                ))
-            else:
-                # Different args - each alias gets its own to_attr
-                for group in groups:
-                    alias = group[0].alias
-                    to_attr = f"{ALIAS_PREFIX}{alias.value}" if alias else None
-                    merged_node_lists.append((group, to_attr))
+            continue
+
+        # Collapse the largest set of aliases sharing arguments and target onto
+        # one default-attribute prefetch; give every other alias its own to_attr.
+        default_groups = _mergeable_alias_groups(
+            groups, object_definition, schema, parent_type=parent_type, info=info
+        )
+        default_ids = {id(group) for group in default_groups}
+        for group in groups:
+            if id(group) in default_ids:
+                continue
+            alias = group[0].alias
+            to_attr = _alias_attr(alias.value) if alias else None
+            merged_node_lists.append((group, to_attr))
+
+        if default_groups:
+            merged_node_lists.append((
+                [node for group in default_groups for node in group],
+                None,
+            ))
 
     selections = [
         (*field_data, to_attr)
@@ -1405,7 +1628,7 @@ def _get_model_hints(
 
         # Add annotations from the field if they exist
         if field_store := _get_hints_from_field(
-            field, f_info=strawberry_info, prefix=prefix
+            field, f_info=strawberry_info, prefix=prefix, hint_key=to_attr
         ):
             store |= field_store
 
